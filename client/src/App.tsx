@@ -1,10 +1,79 @@
 import React, { useEffect, useState } from 'react';
 import './App.css';
+import { DbConnection, ErrorContext, EventContext, Message, User } from './module_bindings';
+import { Identity } from '@clockworklabs/spacetimedb-sdk';
 
 export type PrettyMessage = {
   senderName: string;
   text: string;
 };
+
+function useMessages(conn: DbConnection | null): Message[] {
+    const [messages, setMessages] = useState<Message[]>([]);
+
+    useEffect(() => {
+        if (!conn) return;
+        const onInsert = (_ctx: EventContext, message: Message) => {
+            setMessages(prev => [...prev, message]);
+        };
+        conn.db.message.onInsert(onInsert);
+
+        const onDelete = (_ctx: EventContext, message: Message) => {
+            setMessages(prev =>
+                prev.filter(
+                    m =>
+                        m.text !== message.text &&
+                        m.sent !== message.sent &&
+                        m.sender !== message.sender
+                )
+            );
+        };
+        conn.db.message.onDelete(onDelete);
+
+        return () => {
+            conn.db.message.removeOnInsert(onInsert);
+            conn.db.message.removeOnDelete(onDelete);
+        };
+    }, [conn]);
+
+    return messages;
+}
+
+function useUsers(conn: DbConnection | null): Map<string, User> {
+    const [users, setUsers] = useState<Map<string, User>>(new Map());
+
+    useEffect(() => {
+        if (!conn) return;
+        const onInsert = (_ctx: EventContext, user: User) => {
+            setUsers(prev => new Map(prev.set(user.identity.toHexString(), user)));
+        };
+        conn.db.user.onInsert(onInsert);
+
+        const onUpdate = (_ctx: EventContext, oldUser: User, newUser: User) => {
+            setUsers(prev => {
+                prev.delete(oldUser.identity.toHexString());
+                return new Map(prev.set(newUser.identity.toHexString(), newUser));
+            });
+        };
+        conn.db.user.onUpdate(onUpdate);
+
+        const onDelete = (_ctx: EventContext, user: User) => {
+            setUsers(prev => {
+                prev.delete(user.identity.toHexString());
+                return new Map(prev);
+            });
+        };
+        conn.db.user.onDelete(onDelete);
+
+        return () => {
+            conn.db.user.removeOnInsert(onInsert);
+            conn.db.user.removeOnUpdate(onUpdate);
+            conn.db.user.removeOnDelete(onDelete);
+        };
+    }, [conn]);
+
+    return users;
+}
 
 function App() {
   const [newName, setNewName] = useState('');
@@ -12,21 +81,122 @@ function App() {
   const [systemMessage, setSystemMessage] = useState('');
   const [newMessage, setNewMessage] = useState('');
 
-  const prettyMessages: PrettyMessage[] = [];
+    const [connected, setConnected] = useState<boolean>(false);
+    const [identity, setIdentity] = useState<Identity | null>(null);
+    const [conn, setConn] = useState<DbConnection | null>(null);
 
-  const name = '';
+    const messages = useMessages(conn);
+    const users = useUsers(conn);
 
-  const onSubmitNewName = (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    setSettingName(false);
-    // TODO: Call `setName` reducer
-  };
+    const prettyMessages: PrettyMessage[] = messages
+        .sort((a, b) => (a.sent > b.sent ? 1 : -1))
+        .map(message => ({
+            senderName:
+                users.get(message.sender.toHexString())?.name ||
+                message.sender.toHexString().substring(0, 8),
+            text: message.text,
+        }));
 
-  const onMessageSubmit = (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    setNewMessage('');
-    // TODO: Call `sendMessage` reducer
-  };
+    useEffect(() => {
+        const subscribeToQueries = (conn: DbConnection, queries: string[]) => {
+            let count = 0;
+            for (const query of queries) {
+                conn
+                    ?.subscriptionBuilder()
+                    .onApplied(() => {
+                        count++;
+                        if (count === queries.length) {
+                            console.log('SDK client cache initialized.');
+                        }
+                    })
+                    .subscribe(query);
+            }
+        };
+
+        const onConnect = (
+            conn: DbConnection,
+            identity: Identity,
+            token: string
+        ) => {
+            setIdentity(identity);
+            setConnected(true);
+            localStorage.setItem('auth_token', token);
+            console.log(
+                'Connected to SpacetimeDB with identity:',
+                identity.toHexString()
+            );
+            conn.reducers.onSendMessage(() => {
+                console.log('Message sent.');
+            });
+
+            subscribeToQueries(conn, ['SELECT * FROM message', 'SELECT * FROM user']);
+        };
+
+        const onDisconnect = () => {
+            console.log('Disconnected from SpacetimeDB');
+            setConnected(false);
+        };
+
+        const onConnectError = (_ctx: ErrorContext, err: Error) => {
+            console.log('Error connecting to SpacetimeDB:', err);
+        };
+
+        setConn(
+            DbConnection.builder()
+                .withUri('ws://localhost:3000')
+                .withModuleName('spacetime-paint')
+                .withToken(localStorage.getItem('auth_token') || '')
+                .onConnect(onConnect)
+                .onDisconnect(onDisconnect)
+                .onConnectError(onConnectError)
+                .build()
+        );
+    }, []);
+
+
+    const name =
+        users.get(identity?.toHexString())?.name ||
+        identity?.toHexString().substring(0, 8) ||
+        'unknown';
+
+    const onSubmitNewName = (e: React.FormEvent<HTMLFormElement>) => {
+        e.preventDefault();
+        setSettingName(false);
+        conn.reducers.setName(newName);
+    };
+
+    const onMessageSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+        e.preventDefault();
+        setNewMessage("");
+        conn.reducers.sendMessage(newMessage);
+    };
+
+    useEffect(() => {
+        if (!conn) return;
+        conn.db.user.onInsert((_ctx, user) => {
+            if (user.online) {
+                const name = user.name || user.identity.toHexString().substring(0, 8);
+                setSystemMessage(prev => prev + `\n${name} has connected.`);
+            }
+        });
+        conn.db.user.onUpdate((_ctx, oldUser, newUser) => {
+            const name =
+                newUser.name || newUser.identity.toHexString().substring(0, 8);
+            if (oldUser.online === false && newUser.online === true) {
+                setSystemMessage(prev => prev + `\n${name} has connected.`);
+            } else if (oldUser.online === true && newUser.online === false) {
+                setSystemMessage(prev => prev + `\n${name} has disconnected.`);
+            }
+        });
+    }, [conn]);
+
+    if (!conn || !connected || !identity) {
+        return (
+            <div className="App">
+                <h1>Connecting...</h1>
+            </div>
+        );
+    }
 
   return (
     <div className="App">
